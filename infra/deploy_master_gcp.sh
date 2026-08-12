@@ -412,11 +412,21 @@ PY
 
 # The prompt is a strict template -- agents/common.py matches it with a regex
 # rather than a model, so an approximation is declined rather than parsed.
+#
+# ONE definition, used by both run() and probe(). They had two, and probe()'s
+# was the loose form: every control, positive and negative, got back "I can only
+# help with currency conversion" and was scored UNEXPECTED. Six probes, no
+# measurements, and the only reason that was visible is that a declined reply
+# does not match the success pattern either. A control harness with its own copy
+# of the prompt is a control harness that can drift from the thing it measures.
+conversion_prompt() {
+  echo "Convert 100 USD to the following currencies: ${1}. Reply with JSON."
+}
+
 run() {
   local targets="${1:-EUR, JPY}" reply rc=0
   reply="$(mktemp)"
-  invoke "Convert 100 USD to the following currencies: ${targets}. Reply with JSON." \
-    > "$reply" || rc=$?
+  invoke "$(conversion_prompt "$targets")" > "$reply" || rc=$?
   [[ "$rc" -eq 0 ]] && { render_mesh "$reply" || rc=$?; }
   rm -f "$reply"
   return "$rc"
@@ -461,13 +471,57 @@ probe() {
   )"
   set_env "$vars"
 
-  out="$(invoke "Convert 100 USD to EUR" 2>&1 || true)"
-  if grep -qi "$expect" <<<"$out"; then
-    echo "  ${label}: OK (${expect})"
-  else
-    echo "  ${label}: UNEXPECTED" >&2
-    printf '%s\n' "$out" | head -5 | sed 's/^/    /' >&2
-  fi
+  out="$(mktemp)"
+  invoke "$(conversion_prompt EUR)" > "$out" 2>&1 || true
+
+  # Scored against the mesh envelope, not against a substring of the prose. A
+  # declined prompt, a transport error and a genuine denial all fail to contain
+  # "converted_amount", so matching on absence would score a broken harness as a
+  # successful control -- which is how a negative control lies.
+  #
+  # The reply goes in a FILE and the path is an argument. Interpolating it into
+  # the Python source would break on the first quote or backslash in a provider
+  # error message -- which is exactly the text a negative control exists to read.
+  local verdict
+  verdict="$(python3 - "$expect" "$out" <<'PY'
+import json, sys
+
+expect = sys.argv[1]
+with open(sys.argv[2]) as handle:
+    raw = handle.read()
+envelope = None
+for line in raw.splitlines():
+    line = line.strip()
+    if line.startswith('{"mesh_run"'):
+        try:
+            envelope = json.loads(line)["mesh_run"]
+        except ValueError:
+            pass
+
+if envelope is None:
+    print("VOID no mesh_run envelope -- the master declined or errored")
+    raise SystemExit(0)
+
+results = envelope.get("results", [])
+answered = any(r.get("consensus_amount") is not None for r in results)
+failures = envelope.get("failures", {})
+
+if expect == "answers":
+    print("OK answered" if answered else f"FAIL no answer; failures={failures}")
+else:
+    if answered:
+        print("FAIL the leg answered with its credential removed")
+    elif failures:
+        print(f"OK denied: {list(failures)[0]}={str(list(failures.values())[0])[:90]}")
+    else:
+        print("VOID no answer and no failure recorded")
+PY
+)"
+  rm -f "$out"
+  case "$verdict" in
+    OK*) echo "  ${label}: ${verdict}" ;;
+    *)   echo "  ${label}: ${verdict}" >&2 ;;
+  esac
 }
 
 verify() {
@@ -480,15 +534,17 @@ verify() {
   [[ "$code" == "403" || "$code" == "401" ]] && echo "  invoke: OK (${code})" \
     || echo "  invoke: UNEXPECTED (${code})" >&2
 
+  # Positive first: a denial means nothing until the leg is known to answer at
+  # all. Three of these passing is what makes the next three readable.
   echo "positive controls (each leg alone, as deployed):"
   for cloud in gcp aws azure; do
-    probe "$cloud answers" "$cloud" "" "target_currency"
+    probe "$cloud answers" "$cloud" "" "answers"
   done
 
   echo "negative controls (each leg alone, credential removed):"
-  probe "gcp denied"   "gcp"   "GCP_A2A_AUTH=none"   "error"
-  probe "aws denied"   "aws"   "AWS_A2A_AUTH=none"   "error"
-  probe "azure denied" "azure" "AZURE_A2A_AUTH=none" "error"
+  probe "gcp denied"   "gcp"   "GCP_A2A_AUTH=none"   "denied"
+  probe "aws denied"   "aws"   "AWS_A2A_AUTH=none"   "denied"
+  probe "azure denied" "azure" "AZURE_A2A_AUTH=none" "denied"
 
   echo "restoring the wiring"
   wire >/dev/null
