@@ -22,6 +22,11 @@ in git — it was recovered a week later out of a Cloud Build source tarball, an
 the tests written that day were gone for good, because `.gcloudignore` excludes
 `tests/` and `docs/`. Deploy, then document, then *commit*.
 
+The repo has been in git since 2026-08-12, pushed public to
+[`xbill9/multicloud-adk-a2a-currency-aws`](https://github.com/xbill9/multicloud-adk-a2a-currency-aws)
+as a single initial commit. The rule stands; the recovery story is now history
+rather than the current state, and there is a remote to push to.
+
 ## Ground rule: no virtualenvs, latest everything
 
 **Never create or use a virtualenv.** No `uv venv`, no `python -m venv`, no
@@ -59,6 +64,20 @@ Two lessons from that, worth applying to the next pin:
 - **"latest of each is not a safe assumption" was true on a date and then read
   as a law.** That is exactly how a pin outlives its defect. Write the *measured
   failure* into the comment, never the general warning.
+
+## Running the suite locally
+
+`python3 -m pytest tests/ -q`. Hermetic by default: the eleven
+`tests/test_live_mesh.py` cells skip unless the local mesh is up.
+
+**The skip guard is a port check on :10001–10003, not an identity check**, and
+a sibling project serves the same three module paths (`agents.gcp.server` and
+friends) on the same three ports. If `~/multicloud-a2a-subagent`'s mesh is
+running, `./infra/run_mesh.sh status` reports `up`, the live cells execute
+against *its* agents, and they fail rather than skip. Measured 2026-08-12:
+`11 failed, 127 passed`, the responses carrying an `a2a-research` marker.
+Before believing a live-mesh failure belongs to this repo, check whose it is:
+`ss -ltnp | grep 1000` then `readlink /proc/<pid>/cwd`.
 
 ## Cross-cloud auth: the plan
 
