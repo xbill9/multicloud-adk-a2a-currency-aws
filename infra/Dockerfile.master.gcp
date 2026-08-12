@@ -1,0 +1,69 @@
+# The master, packaged for Cloud Run as a **service**.
+#
+# The same `coordinator.master` server as Dockerfile.master, on the hosting
+# model the comparison needs: a warm, long-lived container rather than a job
+# that starts per execution. Two clauses differ from the AgentCore image and
+# both are load bearing:
+#
+#   platform  linux/amd64   Cloud Run does not run arm64 images; the AgentCore
+#                           image is arm64 and cannot be reused here
+#   port      8080          Cloud Run injects $PORT and routes to it. 9000 is
+#                           AgentCore's contract, not a general one
+#
+# There is no /ping health contract to honour here -- Cloud Run health-checks
+# the port, not a path -- but the endpoint is served anyway, because the mesh
+# reaches this container the same way whichever cloud it sits in.
+FROM --platform=linux/amd64 python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Unpinned deliberately, except where a measured failure says otherwise.
+#
+# `mcp` is PINNED to <2, which is that measured failure and not a defensive
+# pin. On google-adk 2.6.3 with mcp 2.0.0, measured 2026-08-09:
+#
+#   ImportError: cannot import name 'McpHttpClientFactory'
+#                from 'mcp.client.streamable_http'
+#   ModuleNotFoundError: No module named 'mcp.shared.session'
+#
+# mcp 2.0 moved both, ADK still imports them, and ADK's bare try/except around
+# those imports turns it into an empty __all__ rather than an error naming mcp.
+# Re-test against mcp 2.x whenever this area is touched; the fix belongs in
+# google-adk, not here.
+#
+# No vendor auth SDK: the master mints its own tokens off the metadata server
+# and signs its own AWS requests (coordinator/gcp_origin.py). Its brain is
+# three other clouds, so it runs no model.
+RUN pip install \
+      "a2a-sdk[http-server]" \
+      google-adk \
+      "mcp<2" \
+      agent-framework-a2a \
+      agent-framework-core \
+      pydantic \
+      httpx \
+      uvicorn
+
+COPY pyproject.toml README.md ./
+COPY agents ./agents
+COPY clients ./clients
+COPY coordinator ./coordinator
+COPY matrix ./matrix
+COPY protocol ./protocol
+
+RUN pip install --no-deps -e .
+
+# PUBLIC_URL is set at deploy time, once the service URL exists, because the
+# card must advertise the Cloud Run URL rather than this container's bind
+# address. Without it the card advertises 0.0.0.0:8080 -- interop finding 2,
+# which only reproduces once bind and dial addresses differ.
+ENV HOST=0.0.0.0 \
+    PORT=8080 \
+    CURRENCY_COORDINATOR_CLOUD=gcp
+
+EXPOSE 8080
+CMD ["python", "-m", "coordinator.master"]

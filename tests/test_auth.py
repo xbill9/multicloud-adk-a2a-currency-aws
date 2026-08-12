@@ -733,13 +733,44 @@ def test_unknown_mode_is_rejected_rather_than_silently_unauthenticated(monkeypat
     assert exc.value.kind is FailureKind.VALIDATION
 
 
-def test_the_retired_gcp_rooted_modes_are_gone(monkeypatch):
-    """These worked while the master ran on Cloud Run. Leaving them nameable
-    would let a stale wiring look configured and then fail at the mint."""
-    for mode in ("google-id-token", "aws-sigv4", "entra-fic"):
-        monkeypatch.setenv("GCP_A2A_AUTH", mode)
-        with pytest.raises(AdapterError):
-            credentials_for("gcp", "https://x.example")
+def test_the_gcp_rooted_modes_are_nameable_again(monkeypatch):
+    """Restored 2026-08-12 so the Cloud Run master can be redeployed as a
+    service and measured warm-for-warm against AgentCore.
+
+    This replaces ``test_the_retired_gcp_rooted_modes_are_gone``, whose warning
+    still stands and is now handled a different way: a mode is valid only on the
+    host it was written for, so ``gcp_origin`` names the origin in its logs and
+    its metadata failure says outright that a GCP-rooted mode cannot succeed off
+    GCP. Deleting the names was the blunt version of that guard.
+    """
+    monkeypatch.setenv("GCP_A2A_AUTH", "google-id-token")
+    assert credentials_for("gcp", "https://currency-gcp.a.run.app").mode == "google-id-token"
+
+    monkeypatch.setenv("AWS_A2A_AUTH", "aws-sigv4")
+    monkeypatch.setenv("AWS_A2A_ROLE_ARN", "arn:aws:iam::123456789012:role/currency-aws-federated")
+    monkeypatch.setenv("AWS_A2A_REGION", "us-west-2")
+    assert credentials_for("aws", "https://agentcore.example").mode == "aws-sigv4"
+
+    monkeypatch.setenv("AZURE_A2A_AUTH", "entra-fic")
+    monkeypatch.setenv("AZURE_A2A_TENANT_ID", "tenant")
+    monkeypatch.setenv("AZURE_A2A_CLIENT_ID", "client")
+    assert credentials_for("azure", "https://azure.example").mode == "entra-fic"
+
+
+def test_an_unknown_mode_is_still_rejected(monkeypatch):
+    """The guard that mattered: a typo must not resolve to something."""
+    monkeypatch.setenv("GCP_A2A_AUTH", "gcp-id-tokens")
+    with pytest.raises(AdapterError):
+        credentials_for("gcp", "https://x.example")
+
+
+def test_every_gcp_rooted_mode_is_keyless(monkeypatch):
+    """The comparison rests on this: the same Azure leg is keyless from Cloud
+    Run and is not from AgentCore."""
+    from coordinator.auth import GCP_ORIGIN_MODES, is_keyless
+
+    assert all(is_keyless(mode) for mode in GCP_ORIGIN_MODES)
+    assert not is_keyless("entra-client-secret")
 
 
 def test_missing_required_setting_names_the_variable(monkeypatch):

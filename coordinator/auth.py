@@ -254,18 +254,39 @@ def _signing_key(secret: str, date_stamp: str, region: str, service: str) -> byt
 #: All three are rooted in the master's AWS role and implemented in
 #: ``coordinator.aws_origin``; this module keeps the registry so that one
 #: function still answers "how does this leg authenticate".
-AUTH_MODES = (
-    "none",
+#: Every mode names the *origin* it is written for, because both origin modules
+#: ship in one image and a mode is only valid on the host it was built for.
+#: ``google-id-token`` on AgentCore reaches a metadata server that is not there.
+AWS_ORIGIN_MODES = (
     "aws-sigv4-role",
     "gcp-wif-aws",
     "entra-client-secret",
 )
 
+#: The GCP-rooted set, restored 2026-08-12 so the Cloud Run master can be
+#: redeployed as a *service* and measured against AgentCore warm-for-warm. These
+#: three were deleted with the Cloud Run job and are back unchanged in name, so
+#: old wiring and old docs still read correctly.
+GCP_ORIGIN_MODES = (
+    "google-id-token",
+    "aws-sigv4",
+    "entra-fic",
+)
+
+AUTH_MODES = ("none", *AWS_ORIGIN_MODES, *GCP_ORIGIN_MODES)
+
 #: Modes that require no long-lived secret. ``entra-client-secret`` is the only
 #: one that does, and the distinction is reported per leg rather than inferred,
 #: because "which legs were keyless" is the claim this project has to back --
 #: and under an AWS-rooted master that claim now has an exception in it.
-KEYLESS_MODES = frozenset({"none", "aws-sigv4-role", "gcp-wif-aws"})
+#: ``entra-client-secret`` is the only mode that holds a long-lived credential.
+#: All three GCP-rooted modes are keyless, which is the whole point of the
+#: comparison: the same Azure leg is ``entra-fic`` from Cloud Run and
+#: ``entra-client-secret`` from AgentCore, because only one of those hosts mints
+#: OIDC for an arbitrary audience.
+KEYLESS_MODES = frozenset(
+    {"none", "aws-sigv4-role", "gcp-wif-aws", "google-id-token", "aws-sigv4", "entra-fic"}
+)
 
 
 def credentials_for(peer: str, endpoint: str) -> httpx.Auth | None:
@@ -284,6 +305,13 @@ def credentials_for(peer: str, endpoint: str) -> httpx.Auth | None:
         AZURE_A2A_AUTH=entra-client-secret
                                      AZURE_A2A_TENANT_ID=...  AZURE_A2A_CLIENT_ID=...
                                      AZURE_A2A_CLIENT_SECRET_ARN=... (or _SECRET)
+
+    And the GCP-rooted set, for the master running as a Cloud Run service:
+
+        GCP_A2A_AUTH=google-id-token [GCP_A2A_AUDIENCE=<defaults to service root>]
+        AWS_A2A_AUTH=aws-sigv4       AWS_A2A_ROLE_ARN=...  AWS_A2A_REGION=...
+                                     [AWS_A2A_SIGNING_SERVICE=bedrock-agentcore]
+        AZURE_A2A_AUTH=entra-fic     AZURE_A2A_TENANT_ID=...  AZURE_A2A_CLIENT_ID=...
     """
     prefix = peer.upper()
     mode = os.getenv(f"{prefix}_A2A_AUTH", "none").strip().lower()
@@ -296,9 +324,14 @@ def credentials_for(peer: str, endpoint: str) -> httpx.Auth | None:
             f"unknown auth mode {mode!r} for peer {peer} (expected one of {AUTH_MODES})",
         )
 
-    # Imported here rather than at module scope: aws_origin imports the signer
-    # and the cache types from this module, and a top-level import would be
-    # circular.
+    # Imported here rather than at module scope: both origin modules import the
+    # signer and the cache types from this module, and a top-level import would
+    # be circular.
+    if mode in GCP_ORIGIN_MODES:
+        from coordinator import gcp_origin
+
+        return gcp_origin.build(peer, mode, endpoint)
+
     from coordinator import aws_origin
 
     return aws_origin.build(peer, mode, endpoint)
