@@ -1,0 +1,69 @@
+# The master, packaged for Bedrock AgentCore Runtime.
+#
+# Same A2A protocol contract as the AWS agent, and every clause is load
+# bearing:
+#
+#   host      0.0.0.0
+#   port      9000        (not 8080, which is the HTTP protocol's port)
+#   path      /           (not /invocations, which is the HTTP protocol's path)
+#   health    GET /ping -> {"status": "Healthy"}
+#   card      GET /.well-known/agent-card.json
+#   platform  ARM64       (required, not a preference)
+#
+# The difference from Dockerfile.aws is the dependency set, and it is the whole
+# reason this is a separate image: the master is a *client* of three clouds and
+# runs the interop matrix, so it carries all three client stacks. The AWS agent
+# is a server and carries none of them.
+FROM --platform=linux/arm64 python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Unpinned deliberately, except where a measured failure says otherwise.
+#
+# `mcp` is PINNED to <2, which is that measured failure and not a defensive
+# pin. On google-adk 2.6.3 with mcp 2.0.0, measured 2026-08-09:
+#
+#   ImportError: cannot import name 'McpHttpClientFactory'
+#                from 'mcp.client.streamable_http'
+#   ModuleNotFoundError: No module named 'mcp.shared.session'
+#
+# mcp 2.0 moved both, ADK still imports them, and ADK's bare try/except around
+# those imports turns it into an empty __all__ rather than an error naming mcp.
+# Re-test against mcp 2.x whenever this area is touched; the fix belongs in
+# google-adk, not here.
+#
+# No strands-agents and no vendor auth SDK: the master signs its own requests
+# (coordinator/auth.py) and runs no model. Its brain is three other clouds.
+RUN pip install \
+      "a2a-sdk[http-server]" \
+      google-adk \
+      "mcp<2" \
+      agent-framework-a2a \
+      agent-framework-core \
+      pydantic \
+      httpx \
+      uvicorn
+
+COPY pyproject.toml README.md ./
+COPY agents ./agents
+COPY clients ./clients
+COPY coordinator ./coordinator
+COPY matrix ./matrix
+COPY protocol ./protocol
+
+RUN pip install --no-deps -e .
+
+# PUBLIC_URL is set at deploy time, once the runtime ARN exists, because the
+# card must advertise the AgentCore invocations URL rather than this
+# container's bind address. Without it the card advertises 0.0.0.0:9000 --
+# interop finding 2, which only reproduces once bind and dial addresses differ.
+ENV HOST=0.0.0.0 \
+    PORT=9000 \
+    CURRENCY_COORDINATOR_CLOUD=aws
+
+EXPOSE 9000
+CMD ["python", "-m", "coordinator.master"]

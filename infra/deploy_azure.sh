@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# Deploy the Azure leg: the Agent Framework A2AExecutor agent on Container
+# Apps, plus the Entra app registration whose client secret the AgentCore-hosted
+# master presents.
+#
+#   ./infra/deploy_azure.sh deploy     # RG, ACR, env, container app
+#   ./infra/deploy_azure.sh secret     # Entra app registration + client secret
+#   ./infra/deploy_azure.sh auth       # enforce Entra in front of the ingress
+#   ./infra/deploy_azure.sh scale 1    # warm it for a measurement run
+#   ./infra/deploy_azure.sh scale 0    # back to scale-to-zero, the steady state
+#   ./infra/deploy_azure.sh env        # env vars to add to the master
+#   ./infra/deploy_azure.sh verify     # negative controls -- run these
+#   ./infra/deploy_azure.sh url
+#   ./infra/deploy_azure.sh destroy
+#
+# **This is the leg that is not keyless, and that is the finding.** It used to
+# be: a Federated Identity Credential trusting https://accounts.google.com, with
+# the subject pinned to the Cloud-Run-hosted master's service account, and no
+# secret anywhere. Moving the master to AgentCore removed the thing that made
+# that possible. Entra's FIC wants a JWT assertion from an issuer it can
+# discover, an AgentCore execution role is not one, and outside EKS/IRSA or
+# Cognito AWS will not mint a token for an arbitrary audience. There is nothing
+# to federate *with*, so this leg falls back to a client secret.
+#
+# The secret is written straight into AWS Secrets Manager and read by the master
+# with the same role that signs its other two legs, so it is never a plaintext
+# value in the runtime's configuration and never lands in a file here. That
+# reduces the blast radius. It does not restore the claim: one long-lived
+# credential exists, and every summary of this mesh has to say so.
+#
+# `secret` and `auth` are two halves of one story and neither is sufficient. The
+# secret decides who can *obtain* a token for this app; `auth` decides whether
+# the app *demands* one. Ship only the first and the leg reports an auth mode
+# while answering anyone who asks -- a claim about the caller, dressed as a
+# control. That was briefly true here, and it is why `auth` exists.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCATION="${LOCATION:-westus2}"
+RG="${RG:-currency-mesh-rg}"
+ACR="${ACR_NAME:-currencymeshacr}"
+ENVIRONMENT="${ENVIRONMENT:-currency-mesh-env}"
+APP="${APP:-currency-azure}"
+APP_REG="${APP_REG:-currency-mesh-master}"
+IMAGE_TAG="${IMAGE_TAG:-azure-agent}"
+DOCKER="${DOCKER:-docker}"
+
+# Scale-to-zero is the steady state for this mesh: it is a demonstrator, not a
+# service, and paying for an idle replica on three clouds to make a latency
+# table look tidier would be paying to mislead. The cost is a ~20s cold start
+# on every call, which is the single largest number in every deployed table
+# here and is configuration rather than Container Apps being slow.
+#
+# This was hard-coded to 1 while the deployed app sat at 0, so the scripts
+# disagreed with the cloud and the cold starts read as a property of Azure.
+# Set MIN_REPLICAS=1 to warm it for a measurement run; `$0 scale 0` to undo.
+# `direct` stays the default here too, so a plain `deploy` cannot silently
+# put a billable model into the mesh. MODEL_MODE=llm opts in.
+MODEL_MODE="${MODEL_MODE:-direct}"
+
+MIN_REPLICAS="${MIN_REPLICAS:-0}"
+MAX_REPLICAS="${MAX_REPLICAS:-2}"
+
+# Where the client secret is kept, and the region it is kept in -- the master's
+# own, because it is read with the master's execution role.
+SECRET_NAME="${AZURE_SECRET_NAME:-currency-mesh/azure-client-secret}"
+SECRET_REGION="${AWS_REGION:-us-west-2}"
+SECRET_YEARS="${AZURE_SECRET_YEARS:-1}"
+
+app_url() {
+  local fqdn
+  fqdn="$(az containerapp show -n "$APP" -g "$RG" \
+          --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null)"
+  [[ -z "$fqdn" ]] && { echo "container app not deployed" >&2; exit 1; }
+  echo "https://${fqdn}"
+}
+
+secret_arn() {
+  aws secretsmanager describe-secret --region "$SECRET_REGION" \
+    --secret-id "$SECRET_NAME" --query ARN --output text 2>/dev/null
+}
+
+ensure_infra() {
+  az group create -n "$RG" -l "$LOCATION" -o none
+  az acr show -n "$ACR" -g "$RG" -o none 2>/dev/null || \
+    az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
+  az containerapp env show -n "$ENVIRONMENT" -g "$RG" -o none 2>/dev/null || {
+    echo "creating container app environment (this takes a few minutes)"
+    az containerapp env create -n "$ENVIRONMENT" -g "$RG" -l "$LOCATION" -o none
+  }
+}
+
+build_and_push() {
+  local image="${ACR}.azurecr.io/currency-azure:${IMAGE_TAG}"
+  # ACR build runs server-side: no local docker, no architecture guessing, and
+  # it works on a machine that cannot build linux/amd64 natively.
+  {
+    az acr build --registry "$ACR" --resource-group "$RG" \
+      --image "currency-azure:${IMAGE_TAG}" \
+      --file "$REPO/infra/Dockerfile.azure" "$REPO"
+  } >&2
+  echo "$image"
+}
+
+deploy() {
+  ensure_infra
+  local image url principal acr_id
+  image="$(build_and_push)"
+
+  if az containerapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
+    az containerapp update -n "$APP" -g "$RG" --image "$image" -o none
+  else
+    # Created with the ACR admin password because the app has no identity yet;
+    # `registry_identity` below replaces it with managed-identity pull and
+    # deletes the stored secret. See the comment there for why that matters.
+    local pw; pw="$(az acr credential show -n "$ACR" --query 'passwords[0].value' -o tsv)"
+    az containerapp create -n "$APP" -g "$RG" \
+      --environment "$ENVIRONMENT" \
+      --image "$image" \
+      --registry-server "${ACR}.azurecr.io" \
+      --registry-username "$ACR" --registry-password "$pw" \
+      --target-port 8080 --ingress external \
+      --min-replicas "$MIN_REPLICAS" --max-replicas "$MAX_REPLICAS" \
+      --env-vars "CURRENCY_MODEL_MODE=${MODEL_MODE}" HOST=0.0.0.0 PORT=8080 -o none
+  fi
+
+  url="$(app_url)"
+  # Two-phase, as on both other clouds: the card must advertise an ingress FQDN
+  # that does not exist until the app does.
+  az containerapp update -n "$APP" -g "$RG" \
+    --set-env-vars "PUBLIC_URL=${url}" "CURRENCY_MODEL_MODE=${MODEL_MODE}" HOST=0.0.0.0 PORT=8080 -o none
+
+  registry_identity
+
+  echo
+  echo "container app : $url"
+  echo
+  echo "Next: ./infra/deploy_azure.sh secret"
+}
+
+# Pull the image with the app's managed identity instead of the ACR admin
+# password, and delete the stored secret.
+#
+# Written when this was the last long-lived credential in the running system,
+# which it no longer is -- the Entra client secret above outranks it now. Still
+# worth keeping: it is not on any agent-to-agent path (it only pulls the image),
+# and leaving it in place would mean two stored credentials where the topology
+# forces exactly one. Container Apps supports identity-based pull, so the honest
+# fix was available and cheap.
+registry_identity() {
+  local principal acr_id
+  az containerapp identity assign -n "$APP" -g "$RG" --system-assigned -o none
+  principal="$(az containerapp show -n "$APP" -g "$RG" --query identity.principalId -o tsv)"
+  acr_id="$(az acr show -n "$ACR" -g "$RG" --query id -o tsv)"
+  [[ -z "$principal" || -z "$acr_id" ]] && {
+    echo "warning: could not resolve identity or ACR; leaving password auth in place" >&2
+    return 0
+  }
+
+  az role assignment create --assignee-object-id "$principal" \
+    --assignee-principal-type ServicePrincipal \
+    --role AcrPull --scope "$acr_id" -o none 2>/dev/null || true
+
+  az containerapp registry set -n "$APP" -g "$RG" \
+    --server "${ACR}.azurecr.io" --identity system -o none
+
+  # Orphaned once the registry no longer references it.
+  az containerapp secret remove -n "$APP" -g "$RG" \
+    --secret-names "$(echo "${ACR}.azurecr.io-${ACR}" | tr -d '.')" -o none 2>/dev/null || true
+
+  echo "image pull now uses the app's managed identity; ACR secret removed"
+}
+
+# The Entra half. An app registration and a client secret, because there is
+# nothing better available from an AWS-hosted caller -- see the header.
+#
+# The secret goes from `az` into Secrets Manager without touching disk in
+# plaintext or appearing in an argument list: a temp file at mode 600 and
+# `--secret-string file://`, removed on the way out including on failure.
+# Passing it as a literal argument would put it in /proc for anyone on the
+# machine to read, which is a silly way to lose the one credential this
+# topology could not avoid.
+secret() {
+  local app_id password tmp arn
+  app_id="$(az ad app list --display-name "$APP_REG" --query '[0].appId' -o tsv 2>/dev/null)"
+  if [[ -z "$app_id" ]]; then
+    app_id="$(az ad app create --display-name "$APP_REG" --query appId -o tsv)"
+    echo "created app registration $APP_REG ($app_id)"
+    az ad sp create --id "$app_id" -o none 2>/dev/null || true
+  else
+    echo "app registration exists: $app_id"
+  fi
+
+  tmp="$(mktemp)"
+  chmod 600 "$tmp"
+
+  # --append keeps any existing credential alive. Without it a reset
+  # invalidates every other secret on the registration, which is a rude
+  # surprise if anything else was ever pointed at this app.
+  #
+  # Removed explicitly rather than with `trap ... RETURN`: that trap is not
+  # scoped to this function, so it stays armed and fires on the next return of
+  # any function, aborting the script under `set -u`. Measured in the sibling
+  # script, where it killed a control run after its first probe.
+  az ad app credential reset --id "$app_id" --append \
+    --display-name "agentcore-master" --years "$SECRET_YEARS" \
+    --query password -o tsv > "$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; echo "az returned no password" >&2; return 1; }
+
+  if secret_arn >/dev/null 2>&1 && [[ -n "$(secret_arn)" ]]; then
+    aws secretsmanager put-secret-value --region "$SECRET_REGION" \
+      --secret-id "$SECRET_NAME" --secret-string "file://${tmp}" >/dev/null
+    echo "rotated ${SECRET_NAME} in ${SECRET_REGION}"
+  else
+    aws secretsmanager create-secret --region "$SECRET_REGION" \
+      --name "$SECRET_NAME" \
+      --description "Entra client secret for the currency mesh AWS->Azure leg" \
+      --secret-string "file://${tmp}" >/dev/null
+    echo "created ${SECRET_NAME} in ${SECRET_REGION}"
+  fi
+  rm -f "$tmp"
+  arn="$(secret_arn)"
+
+  echo
+  echo "tenant  : $(az account show --query tenantId -o tsv)"
+  echo "clientId: $app_id"
+  echo "secret  : ${arn}"
+  echo
+  echo "This leg is NOT keyless. The master reads that secret with its execution"
+  echo "role; grant it by re-running ./infra/deploy_master_aws.sh wire."
+}
+
+# The enforcement half. Container Apps' built-in auth validates the token at
+# the ingress, before the request reaches the container, so the agent stays
+# credential-free and identical to the one that runs locally -- the same
+# property Cloud Run gives the GCP leg and IAM gives the AWS one.
+auth_enforce() {
+  local app_id tenant
+  app_id="$(az ad app list --display-name "$APP_REG" --query '[0].appId' -o tsv 2>/dev/null)"
+  [[ -z "$app_id" ]] && { echo "no app registration; run: $0 secret" >&2; exit 1; }
+  tenant="$(az account show --query tenantId -o tsv)"
+
+  # Pin both. The issuer alone would accept any app in the tenant; the audience
+  # alone would accept a token minted for this app by a different issuer. And
+  # neither says *who* -- that is the FIC's subject condition, one layer up.
+  az containerapp auth microsoft update -n "$APP" -g "$RG" \
+    --client-id "$app_id" \
+    --issuer "https://sts.windows.net/${tenant}/" \
+    --allowed-audiences "$app_id" \
+    --yes -o none
+
+  # Return401, never the default RedirectToLoginPage. This is an API: a 302 to
+  # an interactive sign-in page is a 200-with-HTML to an A2A client, which then
+  # reports a parse error and sends you looking for a protocol bug.
+  az containerapp auth update -n "$APP" -g "$RG" \
+    --enabled true --unauthenticated-client-action Return401 -o none
+
+  echo "ingress now rejects unauthenticated callers with 401"
+  echo "issuer  : https://sts.windows.net/${tenant}/"
+  echo "audience: ${app_id}"
+}
+
+# Warm the leg for a measurement run, or put it back. Separate from `deploy` so
+# that returning to scale-to-zero costs one command and does not go through a
+# rebuild -- the reason the last drift survived is that nobody was going to
+# redeploy an app just to change one integer back.
+scale() {
+  local n="${1:?usage: $0 scale <min-replicas>}"
+  az containerapp update -n "$APP" -g "$RG" \
+    --min-replicas "$n" --max-replicas "$MAX_REPLICAS" -o none
+  az containerapp show -n "$APP" -g "$RG" \
+    --query '{min:properties.template.scale.minReplicas,
+              max:properties.template.scale.maxReplicas,
+              revision:properties.latestRevisionName}' -o json
+  [[ "$n" -gt 0 ]] && cat <<'EOF'
+
+Warm. This is a MEASUREMENT state, not the steady state -- it bills for an idle
+replica. Latencies recorded now are warm-path numbers and must be labelled as
+such; do not mix them into a table alongside cold ones. Put it back with:
+
+  ./infra/deploy_azure.sh scale 0
+EOF
+  return 0
+}
+
+env_block() {
+  # Resolved and validated before emitting, for the reason written up against
+  # deploy_aws.sh's env_block: a command substitution inside the heredoc runs
+  # in a subshell, so a failure there printed NAME= with nothing after it and
+  # still returned 0, and `wire` pushed the blank into the live coordinator.
+  # This is the same bug in the other sibling; fixing only the one that bit
+  # first would have left the trap armed here.
+  local app_id url tenant arn
+  app_id="$(az ad app list --display-name "$APP_REG" --query '[0].appId' -o tsv)" || return 1
+  url="$(app_url)" || return 1
+  tenant="$(az account show --query tenantId -o tsv)" || return 1
+  arn="$(secret_arn)" || return 1
+
+  local pair
+  for pair in "AZURE_A2A_ENDPOINT:$url" "AZURE_A2A_CLIENT_ID:$app_id" \
+              "AZURE_A2A_TENANT_ID:$tenant" "AZURE_A2A_CLIENT_SECRET_ARN:$arn"; do
+    case "${pair#*:}" in
+      ""|None)
+        echo "error: ${pair%%:*} did not resolve. Is the Container App deployed" >&2
+        echo "       and the '${APP_REG}' registration + secret created (\$0 secret)?" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  cat <<EOF
+# Add to the master (AgentCore runtime) to reach this agent:
+AZURE_A2A_ENDPOINT=${url}
+# NOT keyless -- the only leg in the mesh that is not. Reported per leg in
+# MeshRun.auth_modes so it cannot be summarised away.
+AZURE_A2A_AUTH=entra-client-secret
+AZURE_A2A_TENANT_ID=${tenant}
+AZURE_A2A_CLIENT_ID=${app_id}
+# The secret itself is never wired as a value; the master reads it with its own
+# execution role at first use. Set AZURE_A2A_CLIENT_SECRET instead only for a
+# local run, where there is no role to read it with.
+AZURE_A2A_CLIENT_SECRET_ARN=${arn}
+AZURE_A2A_REGION=${SECRET_REGION}
+# Defaults to <client-id>/.default; set explicitly only if the API exposes a
+# different scope.
+EOF
+}
+
+# `llm` mode's infrastructure, which is separate from everything above because
+# it is the only part of this mesh that is not free at idle.
+#
+# Two constraints drove the choices, and both are regional rather than design
+# preferences. FoundryChatClient speaks the OpenAI Responses API, and westus2 --
+# where the Container App lives -- offers no Azure OpenAI models at all, only
+# open-weight and partner ones. westus3 is the nearest region that has them, so
+# the account goes there and the model call is a cross-region hop; that shows up
+# in the Azure leg's latency and is not a Container Apps cost.
+#
+# The model is a reasoning model on purpose. agents/azure/server.py passes
+# store=False, and agent-framework then asks for reasoning.encrypted_content so
+# state can round-trip without server-side storage. gpt-4.1-mini rejects that
+# with "Encrypted content is not supported with this model", so the choice is
+# between a reasoning model and giving up store=False. Keeping store=False keeps
+# the conversation out of Azure's storage, which is worth more than the latency.
+FOUNDRY_ACCOUNT="${FOUNDRY_ACCOUNT:-currency-mesh-foundry}"
+FOUNDRY_PROJECT="${FOUNDRY_PROJECT:-currency-mesh-proj}"
+FOUNDRY_LOCATION="${FOUNDRY_LOCATION:-westus3}"
+FOUNDRY_DEPLOYMENT="${FOUNDRY_DEPLOYMENT:-currency-reasoning}"
+FOUNDRY_MODEL="${FOUNDRY_MODEL:-gpt-5-mini}"
+
+foundry() {
+  local account_id principal version endpoint
+
+  if ! az cognitiveservices account show -n "$FOUNDRY_ACCOUNT" -g "$RG" >/dev/null 2>&1; then
+    # Cognitive Services accounts SOFT-DELETE, and deleting the resource group
+    # does not purge them. The name stays reserved, and creating it again fails
+    # with FlagMustBeSetForRestore rather than anything mentioning deletion.
+    # So `destroy` followed by `deploy` -- the exact sequence a reader runs to
+    # rebuild from nothing -- could not recreate this account until the
+    # tombstone was purged. Found by doing that teardown on 2026-08-10.
+    if az cognitiveservices account list-deleted \
+         --query "[?name=='${FOUNDRY_ACCOUNT}'] | [0].name" -o tsv 2>/dev/null \
+         | grep -q .; then
+      echo "purging soft-deleted ${FOUNDRY_ACCOUNT} before recreating"
+      az cognitiveservices account purge -n "$FOUNDRY_ACCOUNT" \
+        -g "$RG" -l "$FOUNDRY_LOCATION" -o none 2>/dev/null || true
+    fi
+
+    echo "creating AIServices account ${FOUNDRY_ACCOUNT} in ${FOUNDRY_LOCATION}"
+    az cognitiveservices account create -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+      -l "$FOUNDRY_LOCATION" --kind AIServices --sku S0 \
+      --custom-domain "$FOUNDRY_ACCOUNT" --assign-identity --yes -o none
+  fi
+
+  az cognitiveservices account project show -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+    --project-name "$FOUNDRY_PROJECT" >/dev/null 2>&1 || {
+    echo "creating project ${FOUNDRY_PROJECT}"
+    az cognitiveservices account project create -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+      --project-name "$FOUNDRY_PROJECT" -l "$FOUNDRY_LOCATION" -o none
+  }
+
+  if ! az cognitiveservices account deployment show -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+        --deployment-name "$FOUNDRY_DEPLOYMENT" >/dev/null 2>&1; then
+    version="$(az cognitiveservices model list -l "$FOUNDRY_LOCATION" \
+      --query "[?kind=='AIServices' && model.name=='${FOUNDRY_MODEL}'].model.version" \
+      -o tsv | head -1)"
+    [[ -z "$version" ]] && {
+      echo "error: ${FOUNDRY_MODEL} is not available in ${FOUNDRY_LOCATION}" >&2
+      return 1
+    }
+    echo "deploying ${FOUNDRY_MODEL} ${version} as ${FOUNDRY_DEPLOYMENT}"
+    # GlobalStandard is pay-per-token. A provisioned SKU would bill whether or
+    # not the mesh is running, which would end scale-to-zero for the whole demo.
+    az cognitiveservices account deployment create -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+      --deployment-name "$FOUNDRY_DEPLOYMENT" --model-name "$FOUNDRY_MODEL" \
+      --model-version "$version" --model-format OpenAI \
+      --sku-name GlobalStandard --sku-capacity 20 -o none
+  fi
+
+  # The Container App had no identity at all, so DefaultAzureCredential inside
+  # the container had nothing to present.
+  az containerapp identity assign -n "$APP" -g "$RG" --system-assigned -o none
+  principal="$(az containerapp show -n "$APP" -g "$RG" \
+    --query identity.principalId -o tsv)"
+  account_id="$(az cognitiveservices account show -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+    --query id -o tsv)"
+  [[ -z "$principal" || -z "$account_id" ]] && {
+    echo "error: could not resolve the app identity or the Foundry account" >&2
+    return 1
+  }
+
+  # All three, and the last two are the load-bearing ones. "Azure AI Developer"
+  # alone let the identity see the project and still returned 403 from the
+  # inference call; the deployed agent failed every cell while the identical
+  # code passed locally, because the local principal happened to hold all three.
+  # A local pass is not evidence for the deployed identity.
+  local role
+  for role in "Azure AI Developer" "Cognitive Services User" "Cognitive Services OpenAI User"; do
+    az role assignment create --assignee-object-id "$principal" \
+      --assignee-principal-type ServicePrincipal \
+      --role "$role" --scope "$account_id" -o none 2>/dev/null || true
+  done
+
+  endpoint="$(az cognitiveservices account project show -n "$FOUNDRY_ACCOUNT" -g "$RG" \
+    --project-name "$FOUNDRY_PROJECT" \
+    --query "properties.endpoints.\"AI Foundry API\"" -o tsv)"
+  [[ -z "$endpoint" ]] && { echo "error: no project endpoint" >&2; return 1; }
+
+  az containerapp update -n "$APP" -g "$RG" --set-env-vars \
+    "FOUNDRY_PROJECT_ENDPOINT=${endpoint}" \
+    "AZURE_AI_MODEL_DEPLOYMENT_NAME=${FOUNDRY_DEPLOYMENT}" -o none
+
+  echo "foundry wired:"
+  echo "  FOUNDRY_PROJECT_ENDPOINT=${endpoint}"
+  echo "  AZURE_AI_MODEL_DEPLOYMENT_NAME=${FOUNDRY_DEPLOYMENT}"
+  echo "  identity ${principal} -> Azure AI Developer on ${FOUNDRY_ACCOUNT}"
+  echo
+  echo "the agent still serves CURRENCY_MODEL_MODE=direct; switch it with:"
+  echo "  az containerapp update -n ${APP} -g ${RG} --set-env-vars CURRENCY_MODEL_MODE=llm"
+}
+
+verify() {
+  local url health card arn
+  url="$(app_url)"
+
+  echo "an authenticated leg is unproven without negative controls."
+  echo
+
+  health="$(curl -s -o /dev/null -w '%{http_code}' -m 25 "${url}/health")"
+  card="$(curl -s -o /dev/null -w '%{http_code}' -m 25 "${url}/.well-known/agent-card.json")"
+  echo "1. no token, /health                  -> ${health}   (expect 401)"
+  echo "2. no token, agent card               -> ${card}   (expect 401; discovery"
+  echo "   is privileged here exactly as on the other two clouds)"
+
+  echo "3. enforcement config actually stored:"
+  az containerapp auth show -n "$APP" -g "$RG" \
+    --query '{action:globalValidation.unauthenticatedClientAction,
+              issuer:identityProviders.azureActiveDirectory.registration.openIdIssuer,
+              audiences:identityProviders.azureActiveDirectory.validation.allowedAudiences}' \
+    -o json 2>/dev/null | sed 's/^/   /'
+
+  # What binds this leg to one caller, now that it is a secret rather than a
+  # federated credential. It is a weaker statement than the FIC's was, and
+  # saying so is the point: a FIC named one numeric principal that could ever
+  # obtain a token, whereas a secret authorizes whoever holds it. What is left
+  # is the resource policy on the secret and the IAM role that can read it.
+  echo "4. where the credential lives:"
+  arn="$(secret_arn || true)"
+  if [[ -z "$arn" || "$arn" == "None" ]]; then
+    echo "   no secret in ${SECRET_REGION} -- run: $0 secret"
+  else
+    echo "   ${arn}"
+    echo "   readable by:"
+    aws iam list-roles --query 'Roles[?contains(RoleName, `currency-master`)].RoleName' \
+      --output text 2>/dev/null | sed 's/^/     /'
+    echo "   NOT keyless. A federated credential named the one principal that"
+    echo "   could mint an assertion; a secret authorizes whoever holds it."
+  fi
+
+  echo
+  echo "The positive and negative controls run from the master:"
+  echo "   ./infra/deploy_master_aws.sh verify"
+}
+
+destroy() {
+  az containerapp delete -n "$APP" -g "$RG" --yes -o none 2>/dev/null || true
+  az group delete -n "$RG" --yes --no-wait -o none 2>/dev/null || true
+  local app_id
+  app_id="$(az ad app list --display-name "$APP_REG" --query '[0].appId' -o tsv 2>/dev/null)"
+  [[ -n "$app_id" ]] && az ad app delete --id "$app_id" -o none 2>/dev/null || true
+}
+
+case "${1:-deploy}" in
+  deploy) deploy ;;
+  secret) secret ;;
+  secret-arn) secret_arn ;;
+  foundry) foundry ;;
+  auth) auth_enforce ;;
+  scale) shift; scale "${1:-0}" ;;
+  env) env_block ;;
+  verify) verify ;;
+  url) app_url ;;
+  destroy) destroy ;;
+  *) echo "usage: $0 {deploy|secret|secret-arn|foundry|auth|scale <n>|env|verify|url|destroy}" >&2; exit 2 ;;
+esac
